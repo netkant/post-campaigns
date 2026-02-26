@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Post Campaigns
  * Description: MailWizz Integration for WP. Send MailWizz campaigns via MailWizz API
- * Version: 1.0.0
+ * Version: 1.2.0
  * Author: Netkant
  * Author URI: https://netkant.dk
  * Text Domain: post-campaigns
@@ -18,6 +18,7 @@
  * MAILWIZZ_BASE_URL
  * MAILWIZZ_API_KEY
  * MAILWIZZ_LIST_ID
+ * MAILWIZZ_TEST_LIST_ID (optional)
  * MAILWIZZ_FROM_NAME
  * MAILWIZZ_FROM_EMAIL
  * MAILWIZZ_REPLY_TO
@@ -40,6 +41,8 @@ function post_campaigns_create_campaign($post_title, $post_content, $args = arra
     $api_url = MAILWIZZ_BASE_URL . '/api/index.php/campaigns';
     $api_key = MAILWIZZ_API_KEY;
 
+    $list_uid = isset($args['list_uid']) ? $args['list_uid'] : MAILWIZZ_LIST_ID;
+
     $campaign = array(
         'campaign' => array(
             'name'       => 'Nyhedsbrev - ' . $post_title,
@@ -49,7 +52,7 @@ function post_campaigns_create_campaign($post_title, $post_content, $args = arra
             'subject'    => $post_title,
             'reply_to'   => MAILWIZZ_REPLY_TO,
             'send_at'    => wp_date('Y-m-d H:i:s'),
-            'list_uid'   => MAILWIZZ_LIST_ID,
+            'list_uid'   => $list_uid,
             'options'    => array(
                 'open_tracking'    => 'no',
                 'url_tracking'     => 'no',
@@ -105,13 +108,20 @@ function post_campaigns_send_newsletter_handler($post_ID)
         return;
     }
 
+    // Prevent duplicate campaigns - if a campaign ID already exists, do not send again
+    $existing_campaign_id = get_field('newsletter_campaign_id', $post_ID);
+    if (!empty($existing_campaign_id)) {
+        error_log('Post Campaigns: Attempted to create duplicate campaign for post ' . $post_ID . '. Existing campaign ID: ' . $existing_campaign_id);
+        return;
+    }
+
     ob_start();
     $template = apply_filters('post_campaigns_template', plugin_dir_path(__FILE__) . 'templates/default-mail-template.php');
 
     load_template($template, true, array('post' => $post));
     $post_content = ob_get_clean();
 
-    $response = post_campaigns_create_campaign($post->post_title, $post_content, $post_ID);
+    $response = post_campaigns_create_campaign($post->post_title, $post_content);
     if (is_wp_error($response)) {
         error_log('MailWizz API request error: ' . $response->get_error_message());
         wp_schedule_single_event(date('U', strtotime('+5 minutes')), 'post_campaigns_send_newsletter', array($post_ID));
@@ -132,6 +142,34 @@ function post_campaigns_send_newsletter_handler($post_ID)
 add_action('post_campaigns_send_newsletter', 'post_campaigns_send_newsletter_handler');
 
 /**
+ * Handles sending a test newsletter to the test list.
+ */
+function post_campaigns_send_test_newsletter_handler($post_ID)
+{
+    $post = get_post($post_ID);
+    if (!$post) {
+        return;
+    }
+
+    ob_start();
+    $template = apply_filters('post_campaigns_template', plugin_dir_path(__FILE__) . 'templates/default-mail-template.php');
+
+    load_template($template, true, array('post' => $post));
+    $post_content = ob_get_clean();
+
+    $response = post_campaigns_create_campaign($post->post_title, $post_content, array(
+        'list_uid' => MAILWIZZ_TEST_LIST_ID,
+    ));
+
+    if (is_wp_error($response)) {
+        error_log('Post Campaigns: Test mail API error for post ' . $post_ID . ': ' . $response->get_error_message());
+        return;
+    }
+}
+
+add_action('post_campaigns_send_test_newsletter', 'post_campaigns_send_test_newsletter_handler');
+
+/**
  * Add a cron schedule for the newsletter campaign on save_post.
  */
 add_action('acf/save_post', 'post_campaigns_add_newsletter_cron_schedule', 10, 1);
@@ -139,37 +177,44 @@ function post_campaigns_add_newsletter_cron_schedule($post_ID)
 {
     $post = get_post($post_ID);
 
-
-    if ($post->post_type !== 'post') {
+    if ($post->post_type !== 'press_release') {
         return;
     }
 
     $next_schedule = wp_next_scheduled('post_campaigns_send_newsletter', array($post_ID));
 
-    if ($post->post_status !== 'publish') {
+    // Prevent scheduling if a campaign already exists for this post
+    $existing_campaign_id = get_field('newsletter_campaign_id', $post_ID);
+    if (!empty($existing_campaign_id)) {
+        // Unschedule any existing cron and reset fields
         if ($next_schedule) {
             wp_unschedule_event($next_schedule, 'post_campaigns_send_newsletter', array($post_ID));
         }
+        update_field('send_campaign', false, $post_ID);
+        update_field('newsletter_sendtime', '', $post_ID);
+        return;
+    }
+
+    // If a cron is already scheduled, don't allow changes from stale form data (Gutenberg doesn't reload)
+    // User must cancel the scheduled campaign first before making changes
+    if ($next_schedule) {
+        update_field('send_campaign', true, $post_ID);
+        // Restore the scheduled time to prevent stale form data from overwriting
+        update_field('newsletter_sendtime', $next_schedule, $post_ID);
+        return;
+    }
+
+    if ($post->post_status !== 'publish') {
         return;
     }
 
     $is_enabled = get_field('send_campaign', $post_ID);
-
-    if (!$is_enabled && $next_schedule) {
-        wp_unschedule_event($next_schedule, 'post_campaigns_send_newsletter', array($post_ID));
-        return;
-    }
 
     if (!$is_enabled) {
         return;
     }
 
     $sendtime = get_field('newsletter_sendtime', $post_ID, false);
-
-    if (empty($sendtime) && $next_schedule) {
-        wp_unschedule_event($next_schedule, 'post_campaigns_send_newsletter', array($post_ID));
-        return;
-    }
 
     if (empty($sendtime)) {
         return;
@@ -178,12 +223,7 @@ function post_campaigns_add_newsletter_cron_schedule($post_ID)
     $date = new DateTime($sendtime, wp_timezone());
     $sendtime = $date->getTimestamp();
 
-    if ($next_schedule !== $sendtime) {
-        if ($next_schedule) {
-            wp_unschedule_event($next_schedule, 'post_campaigns_send_newsletter', array($post_ID));
-        }
-        wp_schedule_single_event($sendtime, 'post_campaigns_send_newsletter', array($post_ID));
-    }
+    wp_schedule_single_event($sendtime, 'post_campaigns_send_newsletter', array($post_ID));
 }
 
 add_action('acf/save_post', 'post_campaigns_update_newsletter_campaign_id', 10, 1);

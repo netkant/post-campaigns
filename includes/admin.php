@@ -1,11 +1,65 @@
 <?php
+
+/**
+ * Clear campaign fields after Gutenberg save to prevent stale form data.
+ * Server-side protection prevents duplicate scheduling, this is just for UX.
+ */
+add_action('enqueue_block_editor_assets', function() {
+    global $post;
+    if (!$post || $post->post_type !== 'press_release') {
+        return;
+    }
+
+    $script = "
+    (function($) {
+        var wasSaving = false;
+
+        wp.data.subscribe(function() {
+            var isSaving = wp.data.select('core/editor').isSavingPost();
+            var isAutosaving = wp.data.select('core/editor').isAutosavingPost();
+
+            if (isSaving && !isAutosaving) {
+                wasSaving = true;
+            }
+
+            // After save completes
+            if (wasSaving && !isSaving) {
+                wasSaving = false;
+
+                setTimeout(function() {
+                    // Check if send_campaign was enabled
+                    var sendToggle = $('input[name=\"acf[field_68d0f78166ce7]\"]');
+                    var sendTimeInput = $('input[name=\"acf[field_68d12de00ff3e]\"]');
+
+                    if (sendToggle.is(':checked') && sendTimeInput.val()) {
+                        // Turn off the toggle visually
+                        sendToggle.prop('checked', false).trigger('change');
+                        // Clear the datetime field
+                        sendTimeInput.val('');
+                        // Update ACF's internal state for the toggle
+                        if (typeof acf !== 'undefined') {
+                            var field = acf.getField('field_68d0f78166ce7');
+                            if (field) {
+                                field.\$input().prop('checked', false).trigger('change');
+                            }
+                        }
+                    }
+                }, 300);
+            }
+        });
+    })(jQuery);
+    ";
+
+    wp_add_inline_script('wp-edit-post', $script);
+});
+
 // Add a custom column to the post overview for newsletter campaign ID
-add_filter('manage_post_posts_columns', function($columns) {
+add_filter('manage_press_release_posts_columns', function($columns) {
     $columns['newsletter_campaign'] = __('Newsletter campaign', 'post-campaigns');
     return $columns;
 });
 
-add_action('manage_post_posts_custom_column', function($column, $post_id) {
+add_action('manage_press_release_posts_custom_column', function($column, $post_id) {
     if ($column !== 'newsletter_campaign') {
         return;
     }
@@ -95,7 +149,7 @@ add_action('manage_post_posts_custom_column', function($column, $post_id) {
 
 // Add a "Clear Stats Cache" button to the post edit screen for posts with a campaign ID.
 add_filter('post_row_actions', function($actions, $post) {
-    if ($post->post_type !== 'post') {
+    if ($post->post_type !== 'press_release') {
         return $actions;
     }
     $campaign_id = get_field('newsletter_campaign_id', $post->ID);
@@ -137,14 +191,157 @@ add_action('admin_init', function() {
     }
 }, 10);
 
+// Handle the cancel sending action.
+add_action('admin_init', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php') {
+        return;
+    }
+    if (
+        isset($_GET['post_campaigns_cancel_sending'], $_GET['post'], $_GET['_wpnonce']) &&
+        $_GET['post_campaigns_cancel_sending'] == 1 &&
+        current_user_can('edit_post', intval($_GET['post']))
+    ) {
+        $post_id = intval($_GET['post']);
+        $nonce = $_GET['_wpnonce'];
+        if (!wp_verify_nonce($nonce, 'post_campaigns_cancel_sending_' . $post_id)) {
+            wp_die(__('Security check failed', 'post-campaigns'));
+        }
+
+        // Unschedule the cron event
+        $next_scheduled = wp_next_scheduled('post_campaigns_send_newsletter', array($post_id));
+        if ($next_scheduled) {
+            wp_unschedule_event($next_scheduled, 'post_campaigns_send_newsletter', array($post_id));
+        }
+
+        // Reset the send campaign field
+        update_field('send_campaign', false, $post_id);
+        update_field('newsletter_sendtime', '', $post_id);
+
+        // Set a transient for the admin notice
+        set_transient('post_campaigns_cancelled_' . $post_id, true, 30);
+
+        // Redirect back to the post edit screen.
+        wp_safe_redirect(admin_url('post.php?post=' . $post_id . '&action=edit'));
+        exit;
+    }
+}, 10);
+
+// Show admin notice after cancelling a scheduled campaign
+add_action('admin_notices', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php' || !isset($_GET['post'])) {
+        return;
+    }
+    $post_id = intval($_GET['post']);
+    if (get_transient('post_campaigns_cancelled_' . $post_id)) {
+        delete_transient('post_campaigns_cancelled_' . $post_id);
+        printf(
+            '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
+            esc_html__('Scheduled campaign has been cancelled.', 'post-campaigns')
+        );
+    }
+});
+
+// Handle the delete campaign action.
+add_action('admin_init', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php') {
+        return;
+    }
+    if (
+        isset($_GET['post_campaigns_delete_campaign'], $_GET['post'], $_GET['_wpnonce']) &&
+        $_GET['post_campaigns_delete_campaign'] == 1 &&
+        current_user_can('edit_post', intval($_GET['post']))
+    ) {
+        $post_id = intval($_GET['post']);
+        $nonce = $_GET['_wpnonce'];
+        if (!wp_verify_nonce($nonce, 'post_campaigns_delete_campaign_' . $post_id)) {
+            wp_die(__('Security check failed', 'post-campaigns'));
+        }
+
+        // Clear the campaign ID and cached stats
+        update_field('newsletter_campaign_id', '', $post_id);
+        delete_post_meta($post_id, 'post_campaigns_newsletter_campaign_stats');
+
+        // Set a transient for the admin notice
+        set_transient('post_campaigns_deleted_' . $post_id, true, 30);
+
+        // Redirect back to the post edit screen.
+        wp_safe_redirect(admin_url('post.php?post=' . $post_id . '&action=edit'));
+        exit;
+    }
+}, 10);
+
+// Show admin notice after deleting a campaign
+add_action('admin_notices', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php' || !isset($_GET['post'])) {
+        return;
+    }
+    $post_id = intval($_GET['post']);
+    if (get_transient('post_campaigns_deleted_' . $post_id)) {
+        delete_transient('post_campaigns_deleted_' . $post_id);
+        printf(
+            '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
+            esc_html__('Campaign has been deleted. You can now schedule a new campaign for this post.', 'post-campaigns')
+        );
+    }
+});
+
+// Handle the send test mail action.
+add_action('admin_init', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php') {
+        return;
+    }
+    if (
+        isset($_GET['post_campaigns_send_test_mail'], $_GET['post'], $_GET['_wpnonce']) &&
+        $_GET['post_campaigns_send_test_mail'] == 1 &&
+        current_user_can('edit_post', intval($_GET['post']))
+    ) {
+        $post_id = intval($_GET['post']);
+        $nonce = $_GET['_wpnonce'];
+        if (!wp_verify_nonce($nonce, 'post_campaigns_send_test_mail_' . $post_id)) {
+            wp_die(__('Security check failed', 'post-campaigns'));
+        }
+
+        // Schedule test newsletter for immediate sending
+        wp_schedule_single_event(time(), 'post_campaigns_send_test_newsletter', array($post_id));
+
+        // Set a transient for the admin notice
+        set_transient('post_campaigns_test_mail_sent_' . $post_id, true, 30);
+
+        // Redirect back to the post edit screen.
+        wp_safe_redirect(admin_url('post.php?post=' . $post_id . '&action=edit'));
+        exit;
+    }
+}, 10);
+
+// Show admin notice after scheduling a test mail
+add_action('admin_notices', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php' || !isset($_GET['post'])) {
+        return;
+    }
+    $post_id = intval($_GET['post']);
+    if (get_transient('post_campaigns_test_mail_sent_' . $post_id)) {
+        delete_transient('post_campaigns_test_mail_sent_' . $post_id);
+        printf(
+            '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
+            esc_html__('Test campaign has been scheduled and will be sent to the test list shortly.', 'post-campaigns')
+        );
+    }
+});
+
 // Add "Reload campaign stats" to bulk actions dropdown for posts
-add_filter('bulk_actions-edit-post', function($bulk_actions) {
+add_filter('bulk_actions-edit-press_release', function($bulk_actions) {
     $bulk_actions['post_campaigns_reload_campaign_stats'] = __('Reload campaign stats', 'post-campaigns');
     return $bulk_actions;
 });
 
 // Handle the bulk action for reloading campaign stats
-add_filter('handle_bulk_actions-edit-post', function($redirect_to, $doaction, $post_ids) {
+add_filter('handle_bulk_actions-edit-press_release', function($redirect_to, $doaction, $post_ids) {
     if ($doaction !== 'post_campaigns_reload_campaign_stats') {
         return $redirect_to;
     }

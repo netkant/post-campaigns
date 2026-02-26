@@ -64,7 +64,7 @@ add_action( 'acf/include_fields', function() {
 			'name' => 'newsletter_campaign_id',
 			'aria-label' => '',
 			'type' => 'text',
-			'instructions' => __('This is the link to the campaign in the system. Delete this field and save if you want to create a new campaign in the same post.', 'post-campaigns'),
+			'instructions' => __('The MailWizz campaign ID for this post.', 'post-campaigns'),
 			'required' => 0,
 			'conditional_logic' => 0,
 			'wrapper' => array(
@@ -78,6 +78,24 @@ add_action( 'acf/include_fields', function() {
 			'placeholder' => '',
 			'prepend' => '',
 			'append' => '',
+			'readonly' => 1,
+		),
+		array(
+			'key' => 'field_send_status_display',
+			'label' => __('Send status', 'post-campaigns'),
+			'name' => 'send_status_display',
+			'type' => 'message',
+			'instructions' => '',
+			'required' => 0,
+			'conditional_logic' => 0,
+			'wrapper' => array(
+				'width' => '',
+				'class' => '',
+				'id' => '',
+			),
+			'message' => '',
+			'new_lines' => 'wpautop',
+			'esc_html' => 0,
 		),
 	),
 	'location' => array(
@@ -85,7 +103,7 @@ add_action( 'acf/include_fields', function() {
 			array(
 				'param' => 'post_type',
 				'operator' => '==',
-				'value' => 'post',
+				'value' => 'press_release',
 			),
 		),
 	),
@@ -100,4 +118,70 @@ add_action( 'acf/include_fields', function() {
 	'show_in_rest' => 0,
 ) );
 } );
+
+/**
+ * Prevent campaign ID from being overwritten with empty value.
+ * This protects against stale form data in Gutenberg.
+ */
+add_filter('acf/update_value/key=field_68d397b830e54', function($value, $post_id, $field) {
+	// If new value is empty, check if there's an existing value to preserve
+	if (empty($value)) {
+		$existing = get_post_meta($post_id, 'newsletter_campaign_id', true);
+		if (!empty($existing)) {
+			return $existing;
+		}
+	}
+	return $value;
+}, 10, 3);
+
+/**
+ * Dynamically populate the send status field based on cron and campaign state.
+ */
+add_filter('acf/load_field/key=field_send_status_display', function($field) {
+	$post_id = get_the_ID();
+	if (!$post_id) {
+		$field['message'] = '';
+		return $field;
+	}
+
+	$campaign_id = get_field('newsletter_campaign_id', $post_id);
+	$next_scheduled = wp_next_scheduled('post_campaigns_send_newsletter', array($post_id));
+
+	if ($campaign_id) {
+		$delete_url = add_query_arg(array(
+			'post_campaigns_delete_campaign' => 1,
+			'post' => $post_id,
+			'_wpnonce' => wp_create_nonce('post_campaigns_delete_campaign_' . $post_id),
+		), admin_url('post.php?post=' . $post_id . '&action=edit'));
+
+		$field['message'] = '<span style="color: #46b450; font-weight: 600;">' . esc_html__('Sent', 'post-campaigns') . '</span>';
+		$field['message'] .= '<br><a href="' . esc_url($delete_url) . '" class="button button-small button-link-delete" style="margin-top: 8px;" onclick="return confirm(\'' . esc_js(__('Are you sure you want to delete this campaign ID? This will allow creating a new campaign for this post.', 'post-campaigns')) . '\');">' . esc_html__('Delete campaign', 'post-campaigns') . '</a>';
+	} elseif ($next_scheduled) {
+		$scheduled_time = wp_date('Y-m-d H:i:s', $next_scheduled);
+		$cancel_url = add_query_arg(array(
+			'post_campaigns_cancel_sending' => 1,
+			'post' => $post_id,
+			'_wpnonce' => wp_create_nonce('post_campaigns_cancel_sending_' . $post_id),
+		), admin_url('post.php?post=' . $post_id . '&action=edit'));
+
+		$field['message'] = '<span style="color: #f0b849; font-weight: 600;">' . esc_html__('Pending sending', 'post-campaigns') . '</span>';
+		$field['message'] .= '<br><small>' . sprintf(esc_html__('Scheduled for: %s', 'post-campaigns'), $scheduled_time) . '</small>';
+		$field['message'] .= '<br><a href="' . esc_url($cancel_url) . '" class="button button-small" style="margin-top: 8px;" onclick="return confirm(\'' . esc_js(__('Are you sure you want to cancel this scheduled campaign?', 'post-campaigns')) . '\');">' . esc_html__('Cancel sending', 'post-campaigns') . '</a>';
+	} else {
+		$field['message'] = '<span style="color: #999;">' . esc_html__('Not scheduled', 'post-campaigns') . '</span>';
+	}
+
+	// Add "Send test mail" button if test list is configured and post is published
+	if (defined('MAILWIZZ_TEST_LIST_ID') && get_post_status($post_id) === 'publish') {
+		$test_url = add_query_arg(array(
+			'post_campaigns_send_test_mail' => 1,
+			'post' => $post_id,
+			'_wpnonce' => wp_create_nonce('post_campaigns_send_test_mail_' . $post_id),
+		), admin_url('post.php?post=' . $post_id . '&action=edit'));
+
+		$field['message'] .= '<br><hr><br><label style="font-weight: 500; margin-bottom: 3px;">' . esc_html__('Test Mail', 'post-campaigns') . '</label><br><a href="' . esc_url($test_url) . '" class="button button-small" style="margin-top: 8px;" onclick="return confirm(\'' . esc_js(__('Send a test campaign to the test list?', 'post-campaigns')) . '\');">' . esc_html__('Send test mail', 'post-campaigns') . '</a>';
+	}
+
+	return $field;
+});
 
