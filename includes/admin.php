@@ -55,7 +55,7 @@ add_action('enqueue_block_editor_assets', function() {
 
 // Add a custom column to the post overview for newsletter campaign ID
 add_filter('manage_press_release_posts_columns', function($columns) {
-    $columns['newsletter_campaign'] = __('Newsletter campaign', 'post-campaigns');
+    $columns['newsletter_campaign'] = __('Newsletter', 'post-campaigns');
     return $columns;
 });
 
@@ -104,7 +104,7 @@ add_action('manage_press_release_posts_custom_column', function($column, $post_i
         $rate = isset($stat_item['rate']) ? ' - ' . esc_html($stat_item['rate']) . '%' : '';
         echo '<li>' . $name . ': ' . $stat . $rate . '</li>';
     }
-    echo '<li><a href="' . MAILWIZZ_BASE_URL . '/campaigns/' . urlencode($campaign_id) . '" target="_blank"> ' . __('See campaign', 'post-campaigns') . '</a></li>';
+    echo '<li><a href="' . MAILWIZZ_BASE_URL . '/campaigns/' . urlencode($campaign_id) . '" target="_blank"> ' . __('See newsletter', 'post-campaigns') . '</a></li>';
     echo '<li><p> ' . __('Last updated:', 'post-campaigns') . ': ' . wp_date('Y-m-d H:i:s', $stats['timestamp']) . '</p></li>';
     echo '</ul>';
 
@@ -161,7 +161,7 @@ add_filter('post_row_actions', function($actions, $post) {
         'post' => $post->ID,
         '_wpnonce' => wp_create_nonce('post_campaigns_clear_newsletter_stats_' . $post->ID),
     ));
-    $actions['post_campaigns_clear_newsletter_stats'] = '<a href="' . esc_url($url) . '"style="margin-top:0px;">' . esc_html__('Reload campaign stats', 'post-campaigns') . '</a>';
+    $actions['post_campaigns_clear_newsletter_stats'] = '<a href="' . esc_url($url) . '"style="margin-top:0px;">' . esc_html__('Reload newsletter stats', 'post-campaigns') . '</a>';
     return $actions;
 }, 10, 2);
 
@@ -238,7 +238,7 @@ add_action('admin_notices', function() {
         delete_transient('post_campaigns_cancelled_' . $post_id);
         printf(
             '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
-            esc_html__('Scheduled campaign has been cancelled.', 'post-campaigns')
+            esc_html__('Scheduled newsletter has been cancelled.', 'post-campaigns')
         );
     }
 });
@@ -284,7 +284,7 @@ add_action('admin_notices', function() {
         delete_transient('post_campaigns_deleted_' . $post_id);
         printf(
             '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
-            esc_html__('Campaign has been deleted. You can now schedule a new campaign for this post.', 'post-campaigns')
+            esc_html__('Newsletter record has been deleted. You can now schedule a new newsletter for this post.', 'post-campaigns')
         );
     }
 });
@@ -306,8 +306,22 @@ add_action('admin_init', function() {
             wp_die(__('Security check failed', 'post-campaigns'));
         }
 
-        // Schedule test newsletter for immediate sending
-        wp_schedule_single_event(time(), 'post_campaigns_send_test_newsletter', array($post_id));
+        // Get selected test list ID, fallback to constant
+        $test_list_id = '';
+        if (isset($_GET['test_list_id']) && !empty($_GET['test_list_id'])) {
+            $test_list_id = sanitize_text_field($_GET['test_list_id']);
+        } elseif (defined('MAILWIZZ_TEST_LIST_ID')) {
+            $test_list_id = MAILWIZZ_TEST_LIST_ID;
+        }
+
+        if (empty($test_list_id)) {
+            set_transient('post_campaigns_test_mail_error_' . $post_id, __('No test list selected.', 'post-campaigns'), 30);
+            wp_safe_redirect(admin_url('post.php?post=' . $post_id . '&action=edit'));
+            exit;
+        }
+
+        // Schedule test newsletter with the selected list ID
+        wp_schedule_single_event(time(), 'post_campaigns_send_test_newsletter', array($post_id, $test_list_id));
 
         // Set a transient for the admin notice
         set_transient('post_campaigns_test_mail_sent_' . $post_id, true, 30);
@@ -329,14 +343,14 @@ add_action('admin_notices', function() {
         delete_transient('post_campaigns_test_mail_sent_' . $post_id);
         printf(
             '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
-            esc_html__('Test campaign has been scheduled and will be sent to the test list shortly.', 'post-campaigns')
+            esc_html__('Test newsletter has been scheduled and will be sent to the test list shortly.', 'post-campaigns')
         );
     }
 });
 
 // Add "Reload campaign stats" to bulk actions dropdown for posts
 add_filter('bulk_actions-edit-press_release', function($bulk_actions) {
-    $bulk_actions['post_campaigns_reload_campaign_stats'] = __('Reload campaign stats', 'post-campaigns');
+    $bulk_actions['post_campaigns_reload_campaign_stats'] = __('Reload newsletter stats', 'post-campaigns');
     return $bulk_actions;
 });
 
@@ -369,7 +383,40 @@ add_action('admin_notices', function() {
         if ($count > 0) {
             printf(
                 '<div id="message" class="updated notice notice-success is-dismissible"><p>%s</p></div>',
-                esc_html(sprintf(_n('Reloaded campaign stats for %d post.', 'Reloaded campaign stats for %d posts.', $count, 'post-campaigns'), $count))
+                esc_html(sprintf(_n('Reloaded newsletter stats for %d post.', 'Reloaded newsletter stats for %d posts.', $count, 'post-campaigns'), $count))
+            );
+        }
+    }
+});
+
+// Show admin notice for test mail errors
+add_action('admin_notices', function() {
+    global $pagenow;
+    if ($pagenow !== 'post.php' || !isset($_GET['post'])) {
+        return;
+    }
+    $post_id = intval($_GET['post']);
+    $error = get_transient('post_campaigns_test_mail_error_' . $post_id);
+    if ($error) {
+        delete_transient('post_campaigns_test_mail_error_' . $post_id);
+        printf(
+            '<div class="notice notice-error is-dismissible"><p>%s</p></div>',
+            esc_html($error)
+        );
+    }
+});
+
+// Show admin notice for test list sync errors
+add_action('admin_notices', function() {
+    $transient_key = 'post_campaigns_sync_errors_' . get_current_user_id();
+    $errors = get_transient($transient_key);
+
+    if (!empty($errors) && is_array($errors)) {
+        delete_transient($transient_key);
+        foreach ($errors as $error) {
+            printf(
+                '<div class="notice notice-error is-dismissible"><p>%s</p></div>',
+                esc_html($error)
             );
         }
     }
